@@ -134,8 +134,8 @@ net.ipv4.tcp_no_metrics_save = 1
 
 # DPI & Filtering Compatibility
 net.ipv4.tcp_ecn = 0
+net.ipv4.tcp_fastopen = 0
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_fastopen = 3
 
 # Fast failure cleanup (avoids long socket freezes)
 net.ipv4.tcp_syn_retries = 3
@@ -161,64 +161,66 @@ net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
+net.ipv4.tcp_dsack = 0
 net.ipv4.tcp_window_scaling = 1
 fs.file-max = 1048576
 EOF
     sysctl --system >/dev/null 2>&1
-    echo "PROFILE=gaming" >> "$CONF_DIR/profile.conf"
+    echo "PROFILE=gaming" > "$CONF_DIR/profile.conf"
     echo -e "${GREEN}Gaming profile successfully loaded.${NC}"
 }
 
-# ---------------- Profile 2: High-Speed (Maximum Throughput) ----------------
+# ---------------- Profile 2: High-Speed (Optimized for Iran Links) ----------------
 apply_profile_speed() {
-    echo -e "${CYAN}Applying High-Speed Profile (Maximum Bandwidth & Bulk Transfer)...${NC}"
+    echo -e "${CYAN}Applying Optimized High-Speed Profile (Anti-Drop & Smooth Pacing)...${NC}"
     apply_base_limits
 
     cat > /etc/sysctl.d/99-chisel-tunnel.conf <<'EOF'
-# ===== Profile: High Speed / Maximum Throughput =====
+# ===== Profile: High Speed / Stable Throughput =====
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
-# Enable autocorking to pack maximum payload per packet
-net.ipv4.tcp_autocorking = 1
+# Anti-Burst: Prevent traffic policer drops and carrier rate-limiting
+net.ipv4.tcp_autocorking = 0
+net.ipv4.tcp_notsent_lowat = 16384
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_no_metrics_save = 1
 
-# DPI & Filtering Compatibility
+# DPI & Filtering Compatibility (prevents dropped SYNs/RSTs)
+net.ipv4.tcp_fastopen = 0
 net.ipv4.tcp_ecn = 0
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_fastopen = 3
 
-# Massive TCP Buffers (Saturates high-BDP long-distance links)
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.core.rmem_default = 1048576
-net.core.wmem_default = 1048576
-net.ipv4.tcp_rmem = 4096 1048576 67108864
-net.ipv4.tcp_wmem = 4096 1048576 67108864
+# Optimal 16MB buffers (Prevents bufferbloat while saturating link)
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.ipv4.tcp_rmem = 4096 262144 16777216
+net.ipv4.tcp_wmem = 4096 262144 16777216
 
-# Large queues for bursts of high-bandwidth traffic
-net.core.netdev_max_backlog = 250000
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
+# Traffic queues
+net.core.netdev_max_backlog = 65535
+net.core.somaxconn = 32768
+net.ipv4.tcp_max_syn_backlog = 16384
 
+# Quick recovery from half-dead connections
 net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_time = 30
+net.ipv4.tcp_keepalive_intvl = 5
+net.ipv4.tcp_keepalive_probes = 4
 
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
-net.ipv4.tcp_dsack = 1
+net.ipv4.tcp_dsack = 0
 net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_adv_win_scale = 1
-fs.file-max = 2097152
+fs.file-max = 1048576
 EOF
     sysctl --system >/dev/null 2>&1
-    echo "PROFILE=speed" >> "$CONF_DIR/profile.conf"
-    echo -e "${GREEN}High-Speed profile successfully loaded.${NC}"
+    echo "PROFILE=speed" > "$CONF_DIR/profile.conf"
+    echo -e "${GREEN}High-Speed profile successfully loaded and applied.${NC}"
 }
 
 # ---------------- Profile Selector Prompt ----------------
@@ -226,7 +228,7 @@ select_network_profile() {
     echo ""
     echo -e "${CYAN}Select Network Optimization Profile:${NC}"
     echo -e "  1) ${GREEN}Gaming & Low-Latency${NC}  (Anti-Jitter, Low Ping, Anti-Bufferbloat) [Default]"
-    echo -e "  2) ${YELLOW}High-Speed & Throughput${NC} (Max Bandwidth, Big Buffers, Heavy Downloads)"
+    echo -e "  2) ${YELLOW}High-Speed & Throughput${NC} (Optimized for Download/Upload without Packet Drops)"
     read -p "Choose [1 or 2] (Default: 1): " PROF_CHOICE
 
     mkdir -p "$CONF_DIR"
@@ -269,7 +271,6 @@ CTRL_PORT=$CTRL_PORT
 PORTS=$PORTS
 EOF
 
-    # Prompt user for profile selection
     select_network_profile
 
     cat > /etc/systemd/system/chisel-server.service <<EOF
@@ -363,7 +364,6 @@ CTRL_PORT=$CTRL_PORT
 PORTS=$PORTS
 EOF
 
-    # Prompt user for profile selection
     select_network_profile
 
     cat > /etc/systemd/system/chisel-client.service <<EOF
@@ -427,7 +427,8 @@ status_tunnel() {
         [ -f "$CONF_DIR/profile.conf" ] && source "$CONF_DIR/profile.conf"
         echo "Tuning Profile: ${PROFILE:-custom}"
         echo "Congestion Control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) | Qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
-        echo "TCP Auto-corking: $(sysctl -n net.ipv4.tcp_autocorking 2>/dev/null) (0=Low-Latency/Gaming, 1=High-Speed)"
+        echo "TCP Auto-corking: $(sysctl -n net.ipv4.tcp_autocorking 2>/dev/null)"
+        echo "Max Read Buffer: $(sysctl -n net.core.rmem_max 2>/dev/null)"
     fi
     if ! systemctl list-unit-files 2>/dev/null | grep -qE "^chisel-(server|client)\.service"; then
         echo -e "${RED}No tunnel is installed.${NC}"
