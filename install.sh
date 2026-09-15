@@ -106,8 +106,8 @@ install_server() {
     need_root
     install_chisel
 
-    read -p "Control port (the port the client will connect to) [8080]: " CTRL_PORT
-    CTRL_PORT=${CTRL_PORT:-8080}
+    read -p "Control port (the port the client will connect to) [443]: " CTRL_PORT
+    CTRL_PORT=${CTRL_PORT:-443}
 
     read -p "Ports whose traffic should pass through the tunnel (comma-separated, e.g. 443,2083,8443): " PORTS
     if [ -z "$PORTS" ]; then
@@ -115,16 +115,11 @@ install_server() {
         return
     fi
 
-    AUTH_USER="chisel"
-    AUTH_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)
-
     mkdir -p "$CONF_DIR"
     cat > "$CONF_DIR/server.conf" <<EOF
 ROLE=server
 CTRL_PORT=$CTRL_PORT
 PORTS=$PORTS
-AUTH_USER=$AUTH_USER
-AUTH_PASS=$AUTH_PASS
 EOF
 
     cat > /etc/systemd/system/chisel-server.service <<EOF
@@ -135,7 +130,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$BIN server --host 0.0.0.0 --port $CTRL_PORT --reverse --auth ${AUTH_USER}:${AUTH_PASS} --keepalive 25s
+ExecStart=$BIN server --host 0.0.0.0 --port $CTRL_PORT --reverse --keepalive 25s
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -148,7 +143,8 @@ EOF
     systemctl daemon-reload
     systemctl enable --now chisel-server
 
-    # Open firewall ports if ufw is present
+    # Open firewall ports: ufw (if present) AND raw iptables (in case the
+    # default INPUT policy is DROP even without ufw active)
     if command -v ufw &>/dev/null; then
         ufw allow "${CTRL_PORT}/tcp" >/dev/null 2>&1
         IFS=',' read -ra PARR <<< "$PORTS"
@@ -159,16 +155,39 @@ EOF
         done
     fi
 
+    iptables -C INPUT -p tcp --dport "$CTRL_PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$CTRL_PORT" -j ACCEPT
+    IFS=',' read -ra PARR <<< "$PORTS"
+    for p in "${PARR[@]}"; do
+        p=$(echo "$p" | xargs)
+        iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$p" -j ACCEPT
+        iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$p" -j ACCEPT
+    done
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save >/dev/null 2>&1
+    elif command -v iptables-save &>/dev/null; then
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null
+    fi
+
     setup_watchdog "server"
+
+    # Local reachability self-test
+    sleep 1
+    if timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$CTRL_PORT" 2>/dev/null; then
+        echo -e "${GREEN}Local check passed: port $CTRL_PORT is open on this server.${NC}"
+    else
+        echo -e "${RED}Local check FAILED: port $CTRL_PORT isn't even reachable locally. Check 'systemctl status chisel-server'.${NC}"
+    fi
 
     echo -e "${GREEN}======================================${NC}"
     echo -e "${GREEN}Server installed and running successfully.${NC}"
     echo -e "Server IP    : $(curl -s -4 ifconfig.me 2>/dev/null || echo 'unknown')"
     echo -e "Control Port : ${YELLOW}$CTRL_PORT${NC}"
-    echo -e "Auth User    : ${YELLOW}$AUTH_USER${NC}"
-    echo -e "Auth Pass    : ${YELLOW}$AUTH_PASS${NC}"
     echo -e "Ports        : ${YELLOW}$PORTS${NC}"
     echo -e "${GREEN}You'll need this info when installing the Client — save it somewhere safe.${NC}"
+    echo -e "${YELLOW}If the Client still times out connecting, it's not this server's OS —${NC}"
+    echo -e "${YELLOW}go check your hosting provider's control panel firewall/security group${NC}"
+    echo -e "${YELLOW}and make sure inbound TCP $CTRL_PORT is allowed there too.${NC}"
     echo -e "${GREEN}======================================${NC}"
 }
 
@@ -179,8 +198,6 @@ install_client() {
 
     read -p "Iran server IP: " IRAN_IP
     read -p "Server control port: " CTRL_PORT
-    read -p "Auth User: " AUTH_USER
-    read -p "Auth Pass: " AUTH_PASS
     read -p "Ports to forward (comma-separated, must match the server side exactly): " PORTS
 
     if [ -z "$IRAN_IP" ] || [ -z "$CTRL_PORT" ] || [ -z "$PORTS" ]; then
@@ -200,8 +217,6 @@ install_client() {
 ROLE=client
 IRAN_IP=$IRAN_IP
 CTRL_PORT=$CTRL_PORT
-AUTH_USER=$AUTH_USER
-AUTH_PASS=$AUTH_PASS
 PORTS=$PORTS
 EOF
 
@@ -213,7 +228,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$BIN client --auth ${AUTH_USER}:${AUTH_PASS} --keepalive 25s --max-retry-interval 5s ${IRAN_IP}:${CTRL_PORT}${RMAPS}
+ExecStart=$BIN client --keepalive 25s --max-retry-interval 5s ${IRAN_IP}:${CTRL_PORT}${RMAPS}
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -292,6 +307,27 @@ uninstall_all() {
     for svc in chisel-server chisel-client chisel-watchdog.timer chisel-watchdog.service; do
         systemctl disable --now "$svc" 2>/dev/null
     done
+
+    # Remove the iptables rules we added, using the saved config
+    for f in "$CONF_DIR/server.conf" "$CONF_DIR/client.conf"; do
+        if [ -f "$f" ]; then
+            source "$f"
+            [ -n "$CTRL_PORT" ] && iptables -D INPUT -p tcp --dport "$CTRL_PORT" -j ACCEPT 2>/dev/null
+            if [ -n "$PORTS" ]; then
+                IFS=',' read -ra PARR <<< "$PORTS"
+                for p in "${PARR[@]}"; do
+                    p=$(echo "$p" | xargs)
+                    iptables -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null
+                    iptables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null
+                done
+            fi
+        fi
+    done
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save >/dev/null 2>&1
+    elif command -v iptables-save &>/dev/null && [ -d /etc/iptables ]; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null
+    fi
 
     rm -f /etc/systemd/system/chisel-server.service
     rm -f /etc/systemd/system/chisel-client.service
