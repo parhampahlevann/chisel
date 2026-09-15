@@ -43,36 +43,75 @@ install_chisel() {
 
     CH_VER="1.10.1"
     FILE_NAME="chisel_${CH_VER}_linux_${CH_ARCH}.gz"
+    ORIGIN_URL="https://github.com/jpillora/chisel/releases/download/v${CH_VER}/${FILE_NAME}"
 
+    # Direct URL + several proxy/mirror fronts (gh-proxy/ghproxy domains rotate a lot,
+    # so we try a wide list and don't rely on any single one being alive).
     MIRRORS=(
-        "https://gh-proxy.com/https://github.com/jpillora/chisel/releases/download/v${CH_VER}/${FILE_NAME}"
-        "https://mirror.ghproxy.com/https://github.com/jpillora/chisel/releases/download/v${CH_VER}/${FILE_NAME}"
-        "https://github.com/jpillora/chisel/releases/download/v${CH_VER}/${FILE_NAME}"
+        "$ORIGIN_URL"
+        "https://ghproxy.com/${ORIGIN_URL}"
+        "https://ghproxy.net/${ORIGIN_URL}"
+        "https://gh-proxy.com/${ORIGIN_URL}"
+        "https://mirror.ghproxy.com/${ORIGIN_URL}"
+        "https://hub.gitmirror.com/${ORIGIN_URL}"
+        "https://ghps.cc/${ORIGIN_URL}"
+        "https://gh.ddlc.top/${ORIGIN_URL}"
     )
 
     DOWNLOADED=0
     for URL in "${MIRRORS[@]}"; do
         echo -e "${YELLOW}Fetching Chisel binary from: $URL ...${NC}"
         rm -f /tmp/chisel.gz /tmp/chisel
-        if curl -f -sL --connect-timeout 8 --max-time 45 "$URL" -o /tmp/chisel.gz; then
-            if gzip -t /tmp/chisel.gz 2>/dev/null; then
-                DOWNLOADED=1
-                echo -e "${GREEN}Binary package downloaded and validated.${NC}"
-                break
-            fi
+
+        HTTP_CODE=$(curl -sL -4 --connect-timeout 8 --max-time 60 \
+            --retry 2 --retry-delay 2 \
+            -A "Mozilla/5.0 (X11; Linux x86_64) chisel-installer" \
+            -o /tmp/chisel.gz -w "%{http_code}" "$URL")
+        CURL_EXIT=$?
+
+        if [ "$CURL_EXIT" -ne 0 ]; then
+            echo -e "${RED}  -> curl failed (exit code $CURL_EXIT), trying next mirror...${NC}"
+            continue
         fi
+        if [ "$HTTP_CODE" != "200" ]; then
+            echo -e "${RED}  -> HTTP $HTTP_CODE, trying next mirror...${NC}"
+            continue
+        fi
+        if [ ! -s /tmp/chisel.gz ] || [ "$(stat -c%s /tmp/chisel.gz 2>/dev/null || echo 0)" -lt 100000 ]; then
+            echo -e "${RED}  -> Downloaded file too small / corrupt, trying next mirror...${NC}"
+            continue
+        fi
+        if ! gzip -t /tmp/chisel.gz 2>/dev/null; then
+            echo -e "${RED}  -> File is not a valid gzip archive (likely an HTML error page), trying next mirror...${NC}"
+            continue
+        fi
+
+        DOWNLOADED=1
+        echo -e "${GREEN}Binary package downloaded and validated from: $URL${NC}"
+        break
     done
 
     if [ "$DOWNLOADED" -ne 1 ]; then
-        echo -e "${RED}Error: Failed to download Chisel automatically.${NC}"
-        echo -e "${YELLOW}Please upload the binary manually to $BIN and run chmod +x $BIN${NC}"
+        echo -e "${RED}Error: Failed to download Chisel automatically from any mirror.${NC}"
+        echo -e "${YELLOW}Manual fallback:${NC}"
+        echo -e "  1) Download on any machine with working internet:"
+        echo -e "     ${ORIGIN_URL}"
+        echo -e "  2) Upload/copy the extracted binary to: ${BIN}"
+        echo -e "  3) Run: chmod +x ${BIN}"
         exit 1
     fi
 
     gzip -df /tmp/chisel.gz
     mv /tmp/chisel "$BIN"
     chmod +x "$BIN"
-    echo -e "${GREEN}Chisel v${CH_VER} installed successfully.${NC}"
+
+    if ! "$BIN" --version &>/dev/null; then
+        echo -e "${RED}Error: Downloaded binary failed to execute (wrong arch or corrupted file).${NC}"
+        rm -f "$BIN"
+        exit 1
+    fi
+
+    echo -e "${GREEN}Chisel v${CH_VER} installed successfully: $($BIN --version)${NC}"
 }
 
 # ---------------- Network Profile (Anti-Bufferbloat & Low Jitter) ----------------
