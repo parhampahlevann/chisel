@@ -101,13 +101,88 @@ EOF
     echo -e "${GREEN}Watchdog enabled (checks every 1 minute).${NC}"
 }
 
-# ---------------- Install Server (Iran) ----------------
+# ---------------- Network Profile (Gaming / Low-Latency, High-Throughput) ----------------
+apply_network_profile() {
+    echo -e "${CYAN}Applying low-latency / high-stability network profile ...${NC}"
+
+    # Try to load BBR congestion control (usually built into modern Ubuntu kernels)
+    modprobe tcp_bbr 2>/dev/null
+    echo "tcp_bbr" > /etc/modules-load.d/chisel-bbr.conf 2>/dev/null
+
+    cat > /etc/sysctl.d/99-chisel-tunnel.conf <<'EOF'
+# ===== Chisel Tunnel - Low-Latency / High-Throughput Profile (gaming-grade) =====
+
+# BBR congestion control + fq qdisc: best combo for low latency + high throughput on lossy/long links
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# Bigger TCP buffers so throughput isn't buffer-starved on high-latency links
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.tcp_rmem = 4096 1048576 67108864
+net.ipv4.tcp_wmem = 4096 1048576 67108864
+
+# Faster handshake, smarter MTU, no cold-start penalty after idle (kills the "reconnect lag" feel)
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_window_scaling = 1
+
+# Reduce buffer-induced (bufferbloat) latency/jitter for interactive traffic
+net.ipv4.tcp_notsent_lowat = 16384
+
+# Bigger backlog so bursts of connections/packets don't get dropped under load
+net.core.netdev_max_backlog = 250000
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# Faster dead-connection / half-open cleanup
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 6
+
+fs.file-max = 1048576
+EOF
+
+    sysctl --system >/dev/null 2>&1
+
+    # Raise open-file limits system-wide too (beyond the per-service LimitNOFILE)
+    if ! grep -q "chisel-tunnel" /etc/security/limits.conf 2>/dev/null; then
+        cat >> /etc/security/limits.conf <<'EOF'
+# chisel-tunnel: raised file descriptor limits
+* soft nofile 1048576
+* hard nofile 1048576
+EOF
+    fi
+
+    CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [ "$CC" == "bbr" ]; then
+        echo -e "${GREEN}Network profile applied — congestion control: bbr, qdisc: fq.${NC}"
+    else
+        echo -e "${YELLOW}Network profile applied, but BBR isn't active (current: ${CC:-unknown}).${NC}"
+        echo -e "${YELLOW}Your kernel may not support it — a reboot can help, otherwise it's not critical.${NC}"
+    fi
+}
+
+
 install_server() {
     need_root
     install_chisel
 
-    read -p "Control port (the port the client will connect to) [443]: " CTRL_PORT
-    CTRL_PORT=${CTRL_PORT:-443}
+    CTRL_PORT=""
+    while [ -z "$CTRL_PORT" ]; do
+        read -p "Control port (the port the client will connect to, e.g. 443, 2087, 51820): " CTRL_PORT
+        if ! [[ "$CTRL_PORT" =~ ^[0-9]+$ ]] || [ "$CTRL_PORT" -lt 1 ] || [ "$CTRL_PORT" -gt 65535 ]; then
+            echo -e "${RED}Invalid port. Enter a number between 1 and 65535.${NC}"
+            CTRL_PORT=""
+        fi
+    done
 
     read -p "Ports whose traffic should pass through the tunnel (comma-separated, e.g. 443,2083,8443): " PORTS
     if [ -z "$PORTS" ]; then
@@ -122,6 +197,8 @@ CTRL_PORT=$CTRL_PORT
 PORTS=$PORTS
 EOF
 
+    apply_network_profile
+
     cat > /etc/systemd/system/chisel-server.service <<EOF
 [Unit]
 Description=Chisel Reverse Tunnel Server (Iran)
@@ -130,7 +207,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$BIN server --host 0.0.0.0 --port $CTRL_PORT --reverse --keepalive 25s
+ExecStart=$BIN server --host 0.0.0.0 --port $CTRL_PORT --reverse --keepalive 10s
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -220,6 +297,8 @@ CTRL_PORT=$CTRL_PORT
 PORTS=$PORTS
 EOF
 
+    apply_network_profile
+
     cat > /etc/systemd/system/chisel-client.service <<EOF
 [Unit]
 Description=Chisel Reverse Tunnel Client (Kharej)
@@ -228,7 +307,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$BIN client --keepalive 25s --max-retry-interval 5s ${IRAN_IP}:${CTRL_PORT}${RMAPS}
+ExecStart=$BIN client --keepalive 10s --max-retry-interval 3s ${IRAN_IP}:${CTRL_PORT}${RMAPS}
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -276,6 +355,10 @@ status_tunnel() {
             echo "Recent watchdog events:"
             tail -n 5 "$LOG_FILE"
         fi
+    fi
+    if [ -f /etc/sysctl.d/99-chisel-tunnel.conf ]; then
+        echo -e "${YELLOW}[ Network Profile ]${NC}"
+        echo "Congestion control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) | qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
     fi
     if ! systemctl list-unit-files 2>/dev/null | grep -qE "^chisel-(server|client)\.service"; then
         echo -e "${RED}No tunnel is installed.${NC}"
@@ -337,6 +420,12 @@ uninstall_all() {
     rm -f "$BIN"
     rm -rf "$CONF_DIR"
     rm -f "$LOG_FILE"
+
+    # Remove the network profile
+    rm -f /etc/sysctl.d/99-chisel-tunnel.conf
+    rm -f /etc/modules-load.d/chisel-bbr.conf
+    sed -i '/chisel-tunnel: raised file descriptor limits/,+2d' /etc/security/limits.conf 2>/dev/null
+    sysctl --system >/dev/null 2>&1
 
     systemctl daemon-reload
     systemctl reset-failed 2>/dev/null
