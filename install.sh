@@ -19,17 +19,20 @@ need_root() {
 }
 
 install_dependencies() {
-    command -v curl &>/dev/null || { apt-get update -y && apt-get install -y curl; }
-    command -v iptables &>/dev/null || apt-get install -y iptables
+    echo -e "${CYAN}Checking & installing dependencies...${NC}"
+    apt-get update -y >/dev/null 2>&1
+    apt-get install -y curl gzip ca-certificates iptables >/dev/null 2>&1
 }
 
-# ---------------- Install chisel binary ----------------
+# ---------------- Install Chisel Binary (Mirrored & Verified) ----------------
 install_chisel() {
     if command -v chisel &>/dev/null; then
         echo -e "${GREEN}Chisel is already installed: $(chisel --version)${NC}"
         return
     fi
-    echo -e "${CYAN}Detecting architecture and installing Chisel...${NC}"
+
+    install_dependencies
+
     ARCH=$(uname -m)
     case $ARCH in
         x86_64) CH_ARCH="amd64" ;;
@@ -38,38 +41,53 @@ install_chisel() {
         *) echo -e "${RED}Unsupported architecture: $ARCH${NC}"; exit 1 ;;
     esac
 
-    install_dependencies
+    CH_VER="1.10.1"
+    FILE_NAME="chisel_${CH_VER}_linux_${CH_ARCH}.gz"
 
-    # GitHub API rate-limit fallback
-    LATEST_VER=$(curl -sI https://github.com/jpillora/chisel/releases/latest | grep -i "location:" | sed -n 's/.*tag\/\(.*\)[\r\n]*/\1/p')
-    if [ -z "$LATEST_VER" ]; then
-        LATEST_VER=$(curl -s https://api.github.com/repos/jpillora/chisel/releases/latest | grep '"tag_name"' | cut -d '"' -f4)
+    MIRRORS=(
+        "https://gh-proxy.com/https://github.com/jpillora/chisel/releases/download/v${CH_VER}/${FILE_NAME}"
+        "https://mirror.ghproxy.com/https://github.com/jpillora/chisel/releases/download/v${CH_VER}/${FILE_NAME}"
+        "https://github.com/jpillora/chisel/releases/download/v${CH_VER}/${FILE_NAME}"
+    )
+
+    DOWNLOADED=0
+    for URL in "${MIRRORS[@]}"; do
+        echo -e "${YELLOW}Fetching Chisel binary from: $URL ...${NC}"
+        rm -f /tmp/chisel.gz /tmp/chisel
+        if curl -f -sL --connect-timeout 8 --max-time 45 "$URL" -o /tmp/chisel.gz; then
+            if gzip -t /tmp/chisel.gz 2>/dev/null; then
+                DOWNLOADED=1
+                echo -e "${GREEN}Binary package downloaded and validated.${NC}"
+                break
+            fi
+        fi
+    done
+
+    if [ "$DOWNLOADED" -ne 1 ]; then
+        echo -e "${RED}Error: Failed to download Chisel automatically.${NC}"
+        echo -e "${YELLOW}Please upload the binary manually to $BIN and run chmod +x $BIN${NC}"
+        exit 1
     fi
-    [ -z "$LATEST_VER" ] && LATEST_VER="v1.10.1"
 
-    VER_NUM=${LATEST_VER#v}
-    URL="https://github.com/jpillora/chisel/releases/download/${LATEST_VER}/chisel_${VER_NUM}_linux_${CH_ARCH}.gz"
-
-    curl -sL -o /tmp/chisel.gz "$URL" || { echo -e "${RED}Failed to download Chisel.${NC}"; exit 1; }
-    gunzip -f /tmp/chisel.gz
+    gzip -df /tmp/chisel.gz
     mv /tmp/chisel "$BIN"
     chmod +x "$BIN"
-    echo -e "${GREEN}Chisel $LATEST_VER installed successfully.${NC}"
+    echo -e "${GREEN}Chisel v${CH_VER} installed successfully.${NC}"
 }
 
-# ---------------- Network Profile (Anti-Bufferbloat Gaming Sysctl) ----------------
+# ---------------- Network Profile (Anti-Bufferbloat & Low Jitter) ----------------
 apply_network_profile() {
-    echo -e "${CYAN}Applying ultra-low latency & anti-jitter network profile...${NC}"
+    echo -e "${CYAN}Applying gaming-grade low-latency network profile...${NC}"
 
     modprobe tcp_bbr 2>/dev/null
     echo "tcp_bbr" > /etc/modules-load.d/chisel-bbr.conf 2>/dev/null
 
     cat > /etc/sysctl.d/99-chisel-tunnel.conf <<'EOF'
-# Fair Queueing + BBR for packet loss resilience
+# Congestion Control & Queueing
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
-# Anti-Bufferbloat TCP Buffers (Optimized for ping stability over raw throughput)
+# Anti-Bufferbloat: Moderate buffers prevent massive ping spikes on lossy links
 net.core.rmem_max = 8388608
 net.core.wmem_max = 8388608
 net.core.rmem_default = 262144
@@ -77,20 +95,20 @@ net.core.wmem_default = 262144
 net.ipv4.tcp_rmem = 4096 87380 8388608
 net.ipv4.tcp_wmem = 4096 65536 8388608
 
-# Instant packet delivery (Zero delay for small real-time packets)
+# Instant transmission (zero delay for tiny UDP/TCP game packets)
 net.ipv4.tcp_autocorking = 0
 net.ipv4.tcp_notsent_lowat = 4096
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_fastopen = 3
 
-# Fast timeout and recovery
+# Aggressive keepalive & dead connection drop
 net.ipv4.tcp_fin_timeout = 10
 net.ipv4.tcp_keepalive_time = 30
 net.ipv4.tcp_keepalive_intvl = 5
 net.ipv4.tcp_keepalive_probes = 4
 
-# Buffer limits
+# Backlogs
 net.core.netdev_max_backlog = 100000
 net.core.somaxconn = 32768
 net.ipv4.tcp_max_syn_backlog = 16384
@@ -108,7 +126,7 @@ EOF
     fi
 }
 
-# ---------------- Watchdog ----------------
+# ---------------- Safe Watchdog ----------------
 setup_watchdog() {
     ROLE=$1
     mkdir -p "$(dirname "$LOG_FILE")"
@@ -123,18 +141,18 @@ if ! systemctl is-active --quiet "\$SERVICE"; then
     exit 0
 fi
 
-# Avoid restart loop: Only restart if severe continuous connection drops exceed threshold
+# Only restart if persistent hard connection failures occur (avoids restart loops)
 ERR_COUNT=\$(journalctl -u "\$SERVICE" --since "1 min ago" --no-pager 2>/dev/null | grep -ciE "handshake failed|connection refused|broken pipe")
-if [ "\$ERR_COUNT" -ge 15 ]; then
+if [ "\$ERR_COUNT" -ge 20 ]; then
     systemctl restart "\$SERVICE"
-    echo "\$(date '+%Y-%m-%d %H:%M:%S') - \$SERVICE suffered excessive packet breaks (\$ERR_COUNT) -> restarted" >> "\$LOG"
+    echo "\$(date '+%Y-%m-%d %H:%M:%S') - \$SERVICE hit critical error ceiling (\$ERR_COUNT) -> restarted" >> "\$LOG"
 fi
 EOF
     chmod +x "$WATCHDOG_SCRIPT"
 
     cat > /etc/systemd/system/chisel-watchdog.service <<EOF
 [Unit]
-Description=Chisel Tunnel Health Checker
+Description=Chisel Tunnel Watchdog Worker
 
 [Service]
 Type=oneshot
@@ -143,7 +161,7 @@ EOF
 
     cat > /etc/systemd/system/chisel-watchdog.timer <<EOF
 [Unit]
-Description=Run Chisel Watchdog Timer
+Description=Run Chisel Watchdog every minute
 
 [Timer]
 OnBootSec=1min
@@ -163,20 +181,19 @@ install_server() {
     need_root
     install_chisel
 
-    read -p "Control port (e.g. 443, 2087, 8443): " CTRL_PORT
+    read -p "Enter Control Port (e.g. 443, 2087, 8443): " CTRL_PORT
     while ! [[ "$CTRL_PORT" =~ ^[0-9]+$ ]] || [ "$CTRL_PORT" -lt 1 ] || [ "$CTRL_PORT" -gt 65535 ]; do
         read -p "Invalid port. Enter valid port (1-65535): " CTRL_PORT
     done
 
-    read -p "Ports to expose on Iran (comma-separated, e.g. 2083,51820): " PORTS
+    read -p "Ports to forward through tunnel (comma-separated, e.g. 2083,51820): " PORTS
     if [ -z "$PORTS" ]; then
-        echo -e "${RED}At least one port is required.${NC}"
+        echo -e "${RED}Error: Port list cannot be empty.${NC}"
         return
     fi
 
-    # Generate secure auth token
-    AUTH_SECRET=$(tr -dc A-Za-z0-9 2>/dev/null | head -c 24)
-    [ -z "$AUTH_SECRET" ] && AUTH_SECRET="ChiselPass$(date +%s)"
+    AUTH_SECRET=$(tr -dc A-Za-z0-9 2>/dev/null | head -c 20)
+    [ -z "$AUTH_SECRET" ] && AUTH_SECRET="SecretKey$(date +%s)"
 
     mkdir -p "$CONF_DIR"
     cat > "$CONF_DIR/server.conf" <<EOF
@@ -209,7 +226,7 @@ EOF
     systemctl daemon-reload
     systemctl enable --now chisel-server
 
-    # Firewall configuration
+    # Firewall setup for TCP & UDP
     if command -v ufw &>/dev/null; then
         ufw allow "${CTRL_PORT}/tcp" >/dev/null 2>&1
         IFS=',' read -ra PARR <<< "$PORTS"
@@ -231,12 +248,12 @@ EOF
     setup_watchdog "server"
 
     echo -e "${GREEN}==============================================${NC}"
-    echo -e "${GREEN}Chisel Server configured successfully!${NC}"
+    echo -e "${GREEN}Chisel Server installed and active!${NC}"
     echo -e "Server Control Port : ${YELLOW}$CTRL_PORT${NC}"
-    echo -e "Forwarded Ports     : ${YELLOW}$PORTS (TCP & UDP)${NC}"
+    echo -e "Forwarded Ports     : ${YELLOW}$PORTS (TCP & UDP Enabled)${NC}"
     echo -e "Auth Key            : ${CYAN}tunnel:$AUTH_SECRET${NC}"
     echo -e "${GREEN}==============================================${NC}"
-    echo -e "${YELLOW}IMPORTANT: Keep the Auth Key safe. You need it on the Kharej client.${NC}"
+    echo -e "${YELLOW}Save the Auth Key. It is required during Client setup.${NC}"
 }
 
 # ---------------- Client (Kharej) ----------------
@@ -246,15 +263,15 @@ install_client() {
 
     read -p "Iran Server IP: " IRAN_IP
     read -p "Server Control Port: " CTRL_PORT
-    read -p "Ports to forward (must match Server, e.g. 2083,51820): " PORTS
-    read -p "Auth Key (from server installation): " AUTH_KEY
+    read -p "Ports to bridge (comma-separated, same as server): " PORTS
+    read -p "Auth Key (from server): " AUTH_KEY
 
     if [ -z "$IRAN_IP" ] || [ -z "$CTRL_PORT" ] || [ -z "$PORTS" ] || [ -z "$AUTH_KEY" ]; then
-        echo -e "${RED}Error: All fields are required.${NC}"
+        echo -e "${RED}Error: All inputs are required.${NC}"
         return
     fi
 
-    # Forward BOTH TCP and UDP for every specified port
+    # Forwarding both TCP and UDP for each target port
     IFS=',' read -ra PARR <<< "$PORTS"
     RMAPS=""
     for p in "${PARR[@]}"; do
@@ -297,9 +314,9 @@ EOF
     setup_watchdog "client"
 
     echo -e "${GREEN}==============================================${NC}"
-    echo -e "${GREEN}Chisel Client is configured and running.${NC}"
-    echo -e "Target Node         : ${IRAN_IP}:${CTRL_PORT}"
-    echo -e "Bridged Ports       : ${YELLOW}$PORTS (TCP + UDP Active)${NC}"
+    echo -e "${GREEN}Chisel Client is configured and connected!${NC}"
+    echo -e "Remote Server : ${IRAN_IP}:${CTRL_PORT}"
+    echo -e "Bridged Ports : ${YELLOW}$PORTS (TCP + UDP Active)${NC}"
     echo -e "${GREEN}==============================================${NC}"
 }
 
@@ -308,38 +325,38 @@ status_tunnel() {
     echo -e "${CYAN}====================== STATUS ======================${NC}"
     if systemctl list-unit-files 2>/dev/null | grep -q "^chisel-server.service"; then
         echo -e "${YELLOW}[ Server - Iran ]${NC}"
-        systemctl is-active chisel-server && echo -e "${GREEN}Status: Running${NC}" || echo -e "${RED}Status: Stopped${NC}"
-        source "$CONF_DIR/server.conf" 2>/dev/null
-        echo "Control Port: $CTRL_PORT | Forwarded Ports: $PORTS"
+        systemctl is-active chisel-server && echo -e "${GREEN}State: Active${NC}" || echo -e "${RED}State: Inactive${NC}"
+        [ -f "$CONF_DIR/server.conf" ] && source "$CONF_DIR/server.conf"
+        echo "Control Port: $CTRL_PORT | Bridge Ports: $PORTS"
     fi
     if systemctl list-unit-files 2>/dev/null | grep -q "^chisel-client.service"; then
         echo -e "${YELLOW}[ Client - Kharej ]${NC}"
-        systemctl is-active chisel-client && echo -e "${GREEN}Status: Running${NC}" || echo -e "${RED}Status: Stopped${NC}"
-        source "$CONF_DIR/client.conf" 2>/dev/null
-        echo "Connected to: $IRAN_IP:$CTRL_PORT | Forwarded Ports: $PORTS"
+        systemctl is-active chisel-client && echo -e "${GREEN}State: Active${NC}" || echo -e "${RED}State: Inactive${NC}"
+        [ -f "$CONF_DIR/client.conf" ] && source "$CONF_DIR/client.conf"
+        echo "Remote IP: $IRAN_IP:$CTRL_PORT | Bridge Ports: $PORTS"
     fi
     if [ -f /etc/sysctl.d/99-chisel-tunnel.conf ]; then
-        echo -e "${YELLOW}[ Gaming Profile Metrics ]${NC}"
+        echo -e "${YELLOW}[ Gaming Profile Status ]${NC}"
         echo "Congestion Control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) | Qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
-        echo "TCP Autocorking: $(sysctl -n net.ipv4.tcp_autocorking 2>/dev/null) (0 = Instant Transmission)"
+        echo "TCP Autocorking   : $(sysctl -n net.ipv4.tcp_autocorking 2>/dev/null) (0 = Realtime Send)"
     fi
     echo -e "${CYAN}=====================================================${NC}"
 }
 
-# ---------------- Live Log ----------------
+# ---------------- Live Logs ----------------
 live_log() {
     if systemctl list-unit-files 2>/dev/null | grep -q "^chisel-server.service"; then
         journalctl -u chisel-server -f --no-pager
     elif systemctl list-unit-files 2>/dev/null | grep -q "^chisel-client.service"; then
         journalctl -u chisel-client -f --no-pager
     else
-        echo -e "${RED}No active Chisel tunnel found.${NC}"
+        echo -e "${RED}No active tunnel service found.${NC}"
     fi
 }
 
-# ---------------- Uninstall ----------------
+# ---------------- Complete Uninstall ----------------
 uninstall_all() {
-    read -p "Are you sure you want to remove the tunnel and reset sysctl settings? (yes/no): " CONFIRM
+    read -p "Are you sure you want to remove the tunnel and reset sysctl? (yes/no): " CONFIRM
     [ "$CONFIRM" != "yes" ] && { echo "Aborted."; return; }
 
     systemctl disable --now chisel-server chisel-client chisel-watchdog.timer chisel-watchdog.service 2>/dev/null
@@ -357,10 +374,10 @@ uninstall_all() {
     sysctl --system >/dev/null 2>&1
 
     systemctl daemon-reload
-    echo -e "${GREEN}Everything cleaned up successfully.${NC}"
+    echo -e "${GREEN}Tunnel completely uninstalled and settings reverted.${NC}"
 }
 
-# ---------------- Menu ----------------
+# ---------------- Interactive Menu ----------------
 show_menu() {
     clear
     echo -e "${CYAN}=========================================${NC}"
@@ -370,7 +387,7 @@ show_menu() {
     echo "2) Install Client (Kharej)"
     echo "3) Status Tunnel"
     echo "4) Live Logs"
-    echo "5) Uninstall Tunnel & Reset Settings"
+    echo "5) Uninstall Everything"
     echo "0) Exit"
     echo -e "${CYAN}=========================================${NC}"
     read -p "Select an option [0-5]: " CHOICE
