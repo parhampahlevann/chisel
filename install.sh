@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================================
-#  Chisel Reverse Tunnel Manager
+#  Chisel Reverse Tunnel Manager  (IPv4 + IPv6)
 #  Server = Iran | Client = Kharej (Foreign)
 # ==========================================================
 
@@ -8,6 +8,7 @@ CONF_DIR="/etc/chisel-tunnel"
 BIN="/usr/local/bin/chisel"
 WATCHDOG_SCRIPT="/usr/local/bin/chisel-watchdog.sh"
 LOG_FILE="/var/log/chisel-watchdog.log"
+IPV6_SYSCTL="/etc/sysctl.d/98-chisel-ipv6.conf"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 
@@ -15,6 +16,61 @@ need_root() {
     if [ "$EUID" -ne 0 ]; then
         echo -e "${RED}This script must be run as root (sudo).${NC}"
         exit 1
+    fi
+}
+
+# ---------------- IPv6 helpers ----------------
+ipv6_supported() {
+    [ -f /proc/net/if_inet6 ]
+}
+
+enable_ipv6_sysctl() {
+    cat > "$IPV6_SYSCTL" <<'EOF'
+# chisel-tunnel: make sure IPv6 is not disabled
+net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.default.disable_ipv6 = 0
+net.ipv6.conf.lo.disable_ipv6 = 0
+EOF
+    sysctl -p "$IPV6_SYSCTL" >/dev/null 2>&1
+}
+
+# Remove brackets/spaces the user may have typed: "[2001:db8::1]" -> "2001:db8::1"
+normalize_ipv6() {
+    echo "$1" | tr -d '[] '
+}
+
+valid_ipv6() {
+    [[ "$1" == *:*:* ]] && [[ "$1" =~ ^[0-9a-fA-F:.]+$ ]]
+}
+
+get_local_ipv6() {
+    local v6
+    v6=$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2}' | cut -d/ -f1 | head -n1)
+    [ -z "$v6" ] && v6=$(curl -s -6 --max-time 5 ifconfig.me 2>/dev/null)
+    echo "$v6"
+}
+
+# ---------------- Firewall helpers (IPv4 + IPv6) ----------------
+# fw_allow <proto> <port>   (ip6tables rules only when ENABLE_V6=yes)
+fw_allow() {
+    iptables -C INPUT -p "$1" --dport "$2" -j ACCEPT 2>/dev/null || iptables -I INPUT -p "$1" --dport "$2" -j ACCEPT
+    if [ "$ENABLE_V6" = "yes" ] && command -v ip6tables &>/dev/null; then
+        ip6tables -C INPUT -p "$1" --dport "$2" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p "$1" --dport "$2" -j ACCEPT
+    fi
+}
+
+fw_remove() {
+    iptables -D INPUT -p "$1" --dport "$2" -j ACCEPT 2>/dev/null
+    command -v ip6tables &>/dev/null && ip6tables -D INPUT -p "$1" --dport "$2" -j ACCEPT 2>/dev/null
+}
+
+fw_save() {
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save >/dev/null 2>&1
+    elif command -v iptables-save &>/dev/null; then
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        command -v ip6tables-save &>/dev/null && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
     fi
 }
 
@@ -264,11 +320,29 @@ install_server() {
         return
     fi
 
+    # ---- IPv6 (dual-stack) ----
+    ENABLE_V6="no"
+    LISTEN_HOST="0.0.0.0"
+    if ipv6_supported; then
+        read -p "Enable IPv6 (dual-stack: accept both IPv4 and IPv6)? [Y/n]: " V6_CHOICE
+        case "$V6_CHOICE" in
+            n|N|no|NO) ENABLE_V6="no" ;;
+            *)         ENABLE_V6="yes" ;;
+        esac
+    else
+        echo -e "${YELLOW}IPv6 is not available in this kernel. Continuing with IPv4 only.${NC}"
+    fi
+    if [ "$ENABLE_V6" = "yes" ]; then
+        enable_ipv6_sysctl
+        LISTEN_HOST="[::]"
+    fi
+
     mkdir -p "$CONF_DIR"
     cat > "$CONF_DIR/server.conf" <<EOF
 ROLE=server
 CTRL_PORT=$CTRL_PORT
 PORTS=$PORTS
+IPV6_ENABLED=$ENABLE_V6
 EOF
 
     select_network_profile
@@ -281,7 +355,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$BIN server --host 0.0.0.0 --port $CTRL_PORT --reverse --keepalive 10s
+ExecStart=$BIN server --host $LISTEN_HOST --port $CTRL_PORT --reverse --keepalive 10s
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -304,32 +378,40 @@ EOF
         done
     fi
 
-    iptables -C INPUT -p tcp --dport "$CTRL_PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$CTRL_PORT" -j ACCEPT
+    fw_allow tcp "$CTRL_PORT"
     IFS=',' read -ra PARR <<< "$PORTS"
     for p in "${PARR[@]}"; do
         p=$(echo "$p" | xargs)
-        iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$p" -j ACCEPT
-        iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$p" -j ACCEPT
+        fw_allow tcp "$p"
+        fw_allow udp "$p"
     done
-    if command -v netfilter-persistent &>/dev/null; then
-        netfilter-persistent save >/dev/null 2>&1
-    elif command -v iptables-save &>/dev/null; then
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null
-    fi
+    fw_save
 
     setup_watchdog "server"
 
     sleep 1
     if timeout 3 bash -c "echo > /dev/tcp/127.0.0.1/$CTRL_PORT" 2>/dev/null; then
-        echo -e "${GREEN}Local check passed: port $CTRL_PORT is open on this server.${NC}"
+        echo -e "${GREEN}Local check passed (IPv4): port $CTRL_PORT is open on this server.${NC}"
     else
-        echo -e "${RED}Local check FAILED: port $CTRL_PORT isn't reachable locally. Check 'systemctl status chisel-server'.${NC}"
+        echo -e "${RED}Local check FAILED (IPv4): port $CTRL_PORT isn't reachable locally. Check 'systemctl status chisel-server'.${NC}"
+    fi
+    if [ "$ENABLE_V6" = "yes" ]; then
+        if timeout 3 bash -c "echo > /dev/tcp/::1/$CTRL_PORT" 2>/dev/null; then
+            echo -e "${GREEN}Local check passed (IPv6): port $CTRL_PORT is open on [::1].${NC}"
+        else
+            echo -e "${RED}Local check FAILED (IPv6): port $CTRL_PORT isn't reachable on [::1]. Check 'systemctl status chisel-server'.${NC}"
+        fi
     fi
 
     echo -e "${GREEN}======================================${NC}"
     echo -e "${GREEN}Server installed and running successfully.${NC}"
-    echo -e "Server IP    : $(curl -s -4 ifconfig.me 2>/dev/null || echo 'unknown')"
+    echo -e "Server IPv4  : $(curl -s -4 --max-time 5 ifconfig.me 2>/dev/null || echo 'unknown')"
+    if [ "$ENABLE_V6" = "yes" ]; then
+        V6_ADDR=$(get_local_ipv6)
+        echo -e "Server IPv6  : ${YELLOW}${V6_ADDR:-not found (no global IPv6 on this server)}${NC}"
+    else
+        echo -e "Server IPv6  : disabled"
+    fi
     echo -e "Control Port : ${YELLOW}$CTRL_PORT${NC}"
     echo -e "Ports        : ${YELLOW}$PORTS${NC}"
     echo -e "${GREEN}======================================${NC}"
@@ -340,26 +422,73 @@ install_client() {
     need_root
     install_chisel
 
-    read -p "Iran server IP: " IRAN_IP
+    read -p "Iran server IPv4 (press Enter to skip if you only use IPv6): " IRAN_IP
+    read -p "Iran server IPv6 (optional, press Enter to skip): " IRAN_IPV6
+    IRAN_IPV6=$(normalize_ipv6 "$IRAN_IPV6")
     read -p "Server control port: " CTRL_PORT
     read -p "Ports to forward (comma-separated, must match server side): " PORTS
 
-    if [ -z "$IRAN_IP" ] || [ -z "$CTRL_PORT" ] || [ -z "$PORTS" ]; then
-        echo -e "${RED}Missing information.${NC}"
+    if [ -z "$CTRL_PORT" ] || [ -z "$PORTS" ] || { [ -z "$IRAN_IP" ] && [ -z "$IRAN_IPV6" ]; }; then
+        echo -e "${RED}Missing information (need at least an IPv4 or IPv6 address, the control port and the ports).${NC}"
         return
+    fi
+    if [ -n "$IRAN_IPV6" ] && ! valid_ipv6 "$IRAN_IPV6"; then
+        echo -e "${RED}Invalid IPv6 address: $IRAN_IPV6${NC}"
+        return
+    fi
+
+    # ---- Decide how the client connects (IPv6 preferred when given) ----
+    USE_V6="no"
+    BIND_HOST="0.0.0.0"
+    SERVER_ADDR="${IRAN_IP}:${CTRL_PORT}"
+
+    if [ -n "$IRAN_IPV6" ]; then
+        enable_ipv6_sysctl
+        if ! ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
+            echo -e "${YELLOW}Warning: this server has no global IPv6 address, an IPv6 connection will probably fail.${NC}"
+        fi
+        echo -e "${CYAN}Testing IPv6 connection to [${IRAN_IPV6}]:${CTRL_PORT} ...${NC}"
+        if timeout 5 bash -c "echo > /dev/tcp/${IRAN_IPV6}/${CTRL_PORT}" 2>/dev/null; then
+            echo -e "${GREEN}IPv6 connection to the Iran server works.${NC}"
+            USE_V6="yes"
+        else
+            echo -e "${RED}Could not reach [${IRAN_IPV6}]:${CTRL_PORT} over IPv6 (server not installed yet / IPv6 not routed / port blocked).${NC}"
+            if [ -n "$IRAN_IP" ]; then
+                read -p "Fall back to IPv4 (${IRAN_IP}) for the tunnel connection? [Y/n]: " FB
+                case "$FB" in
+                    n|N|no|NO) USE_V6="yes" ;;
+                    *)         USE_V6="no" ;;
+                esac
+            else
+                read -p "Continue anyway with IPv6? (y/N): " CONT
+                if [ "$CONT" = "y" ] || [ "$CONT" = "Y" ]; then
+                    USE_V6="yes"
+                else
+                    echo "Cancelled."
+                    return
+                fi
+            fi
+        fi
+    fi
+
+    if [ "$USE_V6" = "yes" ]; then
+        SERVER_ADDR="[${IRAN_IPV6}]:${CTRL_PORT}"
+        BIND_HOST="[::]"   # Iran side listens on IPv4 + IPv6 for the forwarded ports
     fi
 
     IFS=',' read -ra PARR <<< "$PORTS"
     RMAPS=""
     for p in "${PARR[@]}"; do
         p=$(echo "$p" | xargs)
-        RMAPS="$RMAPS R:0.0.0.0:${p}:127.0.0.1:${p}"
+        RMAPS="$RMAPS R:${BIND_HOST}:${p}:127.0.0.1:${p}"
     done
 
     mkdir -p "$CONF_DIR"
     cat > "$CONF_DIR/client.conf" <<EOF
 ROLE=client
 IRAN_IP=$IRAN_IP
+IRAN_IPV6=$IRAN_IPV6
+USE_V6=$USE_V6
 CTRL_PORT=$CTRL_PORT
 PORTS=$PORTS
 EOF
@@ -374,7 +503,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$BIN client --keepalive 10s --max-retry-interval 3s ${IRAN_IP}:${CTRL_PORT}${RMAPS}
+ExecStart=$BIN client --keepalive 10s --max-retry-interval 3s ${SERVER_ADDR}${RMAPS}
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -390,7 +519,8 @@ EOF
     setup_watchdog "client"
 
     echo -e "${GREEN}======================================${NC}"
-    echo -e "${GREEN}Client installed and connected to ${IRAN_IP}:${CTRL_PORT}.${NC}"
+    echo -e "${GREEN}Client installed and connected to ${SERVER_ADDR}.${NC}"
+    echo -e "Connection   : ${YELLOW}$([ "$USE_V6" = "yes" ] && echo IPv6 || echo IPv4)${NC}"
     echo -e "Forwarded ports: ${YELLOW}$PORTS${NC}"
     echo -e "${GREEN}======================================${NC}"
 }
@@ -404,7 +534,7 @@ status_tunnel() {
         systemctl status chisel-server --no-pager -l | sed -n '1,10p'
         echo ""
         source "$CONF_DIR/server.conf" 2>/dev/null
-        echo "Control Port: $CTRL_PORT | Ports: $PORTS"
+        echo "Control Port: $CTRL_PORT | Ports: $PORTS | IPv6: ${IPV6_ENABLED:-no}"
     fi
     if systemctl list-unit-files 2>/dev/null | grep -q "^chisel-client.service"; then
         echo -e "${YELLOW}[ Client - Kharej ]${NC}"
@@ -412,7 +542,11 @@ status_tunnel() {
         systemctl status chisel-client --no-pager -l | sed -n '1,10p'
         echo ""
         source "$CONF_DIR/client.conf" 2>/dev/null
-        echo "Connected to: $IRAN_IP:$CTRL_PORT | Ports: $PORTS"
+        if [ "$USE_V6" = "yes" ]; then
+            echo "Connected to: [$IRAN_IPV6]:$CTRL_PORT (IPv6) | Ports: $PORTS"
+        else
+            echo "Connected to: $IRAN_IP:$CTRL_PORT (IPv4) | Ports: $PORTS"
+        fi
     fi
     if systemctl list-unit-files 2>/dev/null | grep -q "^chisel-watchdog.timer"; then
         echo -e "${YELLOW}[ Watchdog ]${NC}"
@@ -429,6 +563,10 @@ status_tunnel() {
         echo "Congestion Control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) | Qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
         echo "TCP Auto-corking: $(sysctl -n net.ipv4.tcp_autocorking 2>/dev/null)"
         echo "Max Read Buffer: $(sysctl -n net.core.rmem_max 2>/dev/null)"
+    fi
+    if [ -f "$IPV6_SYSCTL" ]; then
+        echo -e "${YELLOW}[ IPv6 ]${NC}"
+        echo "Local global IPv6: $(get_local_ipv6 | sed 's/^$/none/')"
     fi
     if ! systemctl list-unit-files 2>/dev/null | grep -qE "^chisel-(server|client)\.service"; then
         echo -e "${RED}No tunnel is installed.${NC}"
@@ -464,13 +602,13 @@ uninstall_all() {
     for f in "$CONF_DIR/server.conf" "$CONF_DIR/client.conf"; do
         if [ -f "$f" ]; then
             source "$f"
-            [ -n "$CTRL_PORT" ] && iptables -D INPUT -p tcp --dport "$CTRL_PORT" -j ACCEPT 2>/dev/null
+            [ -n "$CTRL_PORT" ] && fw_remove tcp "$CTRL_PORT"
             if [ -n "$PORTS" ]; then
                 IFS=',' read -ra PARR <<< "$PORTS"
                 for p in "${PARR[@]}"; do
                     p=$(echo "$p" | xargs)
-                    iptables -D INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null
-                    iptables -D INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null
+                    fw_remove tcp "$p"
+                    fw_remove udp "$p"
                 done
             fi
         fi
@@ -479,6 +617,7 @@ uninstall_all() {
         netfilter-persistent save >/dev/null 2>&1
     elif command -v iptables-save &>/dev/null && [ -d /etc/iptables ]; then
         iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        command -v ip6tables-save &>/dev/null && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
     fi
 
     rm -f /etc/systemd/system/chisel-server.service
@@ -491,6 +630,7 @@ uninstall_all() {
     rm -f "$LOG_FILE"
 
     rm -f /etc/sysctl.d/99-chisel-tunnel.conf
+    rm -f "$IPV6_SYSCTL"
     rm -f /etc/modules-load.d/chisel-bbr.conf
     sed -i '/chisel-tunnel: raised file descriptor limits/,+4d' /etc/security/limits.conf 2>/dev/null
     sysctl --system >/dev/null 2>&1
@@ -505,7 +645,7 @@ uninstall_all() {
 show_menu() {
     clear
     echo -e "${CYAN}=========================================${NC}"
-    echo -e "${CYAN}       Chisel Tunnel Manager (Reverse)   ${NC}"
+    echo -e "${CYAN}   Chisel Tunnel Manager (Reverse, v6)   ${NC}"
     echo -e "${CYAN}=========================================${NC}"
     echo "1) Install Server (Iran)"
     echo "2) Install Client (Kharej)"
